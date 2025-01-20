@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context as _, Result};
 use arrayvec::ArrayString;
-use fs::Fs;
+use fs::{Fs, MTime};
 use futures::{stream::StreamExt, TryFutureExt};
 use futures_batch::ChunksTimeoutStreamExt;
 use gpui::{AppContext, Model, Task};
@@ -20,8 +20,9 @@ use smol::channel;
 use std::{
     future::Future,
     path::Path,
+    pin::pin,
     sync::Arc,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 use util::ResultExt;
 use worktree::Snapshot;
@@ -39,7 +40,7 @@ struct UnsummarizedFile {
     // Path to the file on disk
     path: Arc<Path>,
     // The mtime of the file on disk
-    mtime: Option<SystemTime>,
+    mtime: Option<MTime>,
     // BLAKE3 hash of the source file's contents
     digest: Blake3Digest,
     // The source file's contents
@@ -51,7 +52,7 @@ struct SummarizedFile {
     // Path to the file on disk
     path: String,
     // The mtime of the file on disk
-    mtime: Option<SystemTime>,
+    mtime: Option<MTime>,
     // BLAKE3 hash of the source file's contents
     digest: Blake3Digest,
     // The LLM's summary of the file's contents
@@ -63,7 +64,7 @@ pub type Blake3Digest = ArrayString<{ blake3::OUT_LEN * 2 }>;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FileDigest {
-    pub mtime: Option<SystemTime>,
+    pub mtime: Option<MTime>,
     pub digest: Blake3Digest,
 }
 
@@ -88,7 +89,7 @@ pub struct SummaryIndex {
 }
 
 struct Backlogged {
-    paths_to_digest: channel::Receiver<Vec<(Arc<Path>, Option<SystemTime>)>>,
+    paths_to_digest: channel::Receiver<Vec<(Arc<Path>, Option<MTime>)>>,
     task: Task<Result<()>>,
 }
 
@@ -247,13 +248,14 @@ impl SummaryIndex {
 
     fn check_summary_cache(
         &self,
-        mut might_need_summary: channel::Receiver<UnsummarizedFile>,
+        might_need_summary: channel::Receiver<UnsummarizedFile>,
         cx: &AppContext,
     ) -> NeedsSummary {
         let db_connection = self.db_connection.clone();
         let db = self.summary_db;
         let (needs_summary_tx, needs_summary_rx) = channel::bounded(512);
         let task = cx.background_executor().spawn(async move {
+            let mut might_need_summary = pin!(might_need_summary);
             while let Some(file) = might_need_summary.next().await {
                 let tx = db_connection
                     .read_txn()
@@ -319,7 +321,7 @@ impl SummaryIndex {
         digest_db: heed::Database<Str, SerdeBincode<FileDigest>>,
         txn: &RoTxn<'_>,
         entry: &Entry,
-    ) -> Vec<(Arc<Path>, Option<SystemTime>)> {
+    ) -> Vec<(Arc<Path>, Option<MTime>)> {
         let entry_db_key = db_key_for_path(&entry.path);
 
         match digest_db.get(&txn, &entry_db_key) {
@@ -414,7 +416,7 @@ impl SummaryIndex {
 
     fn digest_files(
         &self,
-        paths: channel::Receiver<Vec<(Arc<Path>, Option<SystemTime>)>>,
+        paths: channel::Receiver<Vec<(Arc<Path>, Option<MTime>)>>,
         worktree_abs_path: Arc<Path>,
         cx: &AppContext,
     ) -> MightNeedSummaryFiles {
@@ -484,12 +486,12 @@ impl SummaryIndex {
 
     fn summarize_files(
         &self,
-        mut unsummarized_files: channel::Receiver<UnsummarizedFile>,
+        unsummarized_files: channel::Receiver<UnsummarizedFile>,
         cx: &AppContext,
     ) -> SummarizeFiles {
         let (summarized_tx, summarized_rx) = channel::bounded(512);
         let task = cx.spawn(|cx| async move {
-            while let Some(file) = unsummarized_files.next().await {
+            while let Ok(file) = unsummarized_files.recv().await {
                 log::debug!("Summarizing {:?}", file);
                 let summary = cx
                     .update(|cx| Self::summarize_code(&file.contents, &file.path, cx))?
@@ -607,7 +609,7 @@ impl SummaryIndex {
         let digest_db = self.file_digest_db;
         let summary_db = self.summary_db;
         cx.background_executor().spawn(async move {
-            let mut summaries = summaries.chunks_timeout(4096, Duration::from_secs(2));
+            let mut summaries = pin!(summaries.chunks_timeout(4096, Duration::from_secs(2)));
             while let Some(summaries) = summaries.next().await {
                 let mut txn = db_connection.write_txn()?;
                 for file in &summaries {
@@ -646,7 +648,7 @@ impl SummaryIndex {
         let start = Instant::now();
         let backlogged = {
             let (tx, rx) = channel::bounded(512);
-            let needs_summary: Vec<(Arc<Path>, Option<SystemTime>)> = {
+            let needs_summary: Vec<(Arc<Path>, Option<MTime>)> = {
                 let mut backlog = self.backlog.lock();
 
                 backlog.drain().collect()

@@ -10,7 +10,7 @@ use gpui::{Model, ModelContext, Subscription, Task};
 use http_client::HttpClient;
 use language::{markdown, Bias, Buffer, BufferSnapshot, Edit, LanguageRegistry, ParsedMarkdown};
 use multi_buffer::MultiBufferRow;
-use project::{Item, Project};
+use project::{Project, ProjectItem};
 use smallvec::SmallVec;
 use sum_tree::SumTree;
 use url::Url;
@@ -154,7 +154,7 @@ impl GitBlame {
                         this.generate(cx);
                     }
                 }
-                project::Event::WorktreeUpdatedGitRepositories => {
+                project::Event::WorktreeUpdatedGitRepositories(_) => {
                     log::debug!("Status of git repositories updated. Regenerating blame data...",);
                     this.generate(cx);
                 }
@@ -538,7 +538,7 @@ async fn parse_markdown(text: &str, language_registry: &Arc<LanguageRegistry>) -
 
     markdown::parse_markdown_block(
         text,
-        language_registry,
+        Some(language_registry),
         None,
         &mut parsed_message.text,
         &mut parsed_message.highlights,

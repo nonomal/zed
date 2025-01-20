@@ -1,6 +1,3 @@
-use std::borrow::BorrowMut;
-use std::{fmt::Display, ops::Range, sync::Arc};
-
 use crate::command::command_interceptor;
 use crate::normal::repeat::Replayer;
 use crate::surrounds::SurroundsType;
@@ -13,12 +10,15 @@ use gpui::{
     Action, AppContext, BorrowAppContext, ClipboardEntry, ClipboardItem, Global, View, WeakView,
 };
 use language::Point;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore};
+use std::borrow::BorrowMut;
+use std::{fmt::Display, ops::Range, sync::Arc};
 use ui::{SharedString, ViewContext};
 use workspace::searchable::Direction;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, JsonSchema, Serialize)]
 pub enum Mode {
     Normal,
     Insert,
@@ -26,6 +26,7 @@ pub enum Mode {
     Visual,
     VisualLine,
     VisualBlock,
+    HelixNormal,
 }
 
 impl Display for Mode {
@@ -37,6 +38,7 @@ impl Display for Mode {
             Mode::Visual => write!(f, "VISUAL"),
             Mode::VisualLine => write!(f, "VISUAL LINE"),
             Mode::VisualBlock => write!(f, "VISUAL BLOCK"),
+            Mode::HelixNormal => write!(f, "HELIX NORMAL"),
         }
     }
 }
@@ -46,6 +48,7 @@ impl Mode {
         match self {
             Mode::Normal | Mode::Insert | Mode::Replace => false,
             Mode::Visual | Mode::VisualLine | Mode::VisualBlock => true,
+            Mode::HelixNormal => false,
         }
     }
 }
@@ -56,28 +59,53 @@ impl Default for Mode {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
 pub enum Operator {
     Change,
     Delete,
     Yank,
     Replace,
-    Object { around: bool },
-    FindForward { before: bool },
-    FindBackward { after: bool },
-    AddSurrounds { target: Option<SurroundsType> },
-    ChangeSurrounds { target: Option<Object> },
+    Object {
+        around: bool,
+    },
+    FindForward {
+        before: bool,
+    },
+    FindBackward {
+        after: bool,
+    },
+    Sneak {
+        first_char: Option<char>,
+    },
+    SneakBackward {
+        first_char: Option<char>,
+    },
+    AddSurrounds {
+        #[serde(skip)]
+        target: Option<SurroundsType>,
+    },
+    ChangeSurrounds {
+        target: Option<Object>,
+    },
     DeleteSurrounds,
     Mark,
-    Jump { line: bool },
+    Jump {
+        line: bool,
+    },
     Indent,
     Outdent,
+    AutoIndent,
     Rewrap,
+    ShellCommand,
     Lowercase,
     Uppercase,
     OppositeCase,
-    Digraph { first_char: Option<char> },
-    Literal { prefix: Option<String> },
+    Digraph {
+        first_char: Option<char>,
+    },
+    Literal {
+        prefix: Option<String>,
+    },
     Register,
     RecordRegister,
     ReplayRegister,
@@ -149,6 +177,11 @@ pub struct VimGlobals {
 
     pub dot_recording: bool,
     pub dot_replaying: bool,
+
+    /// pre_count is the number before an operator is specified (3 in 3d2d)
+    pub pre_count: Option<usize>,
+    /// post_count is the number after an operator is specified (2 in 3d2d)
+    pub post_count: Option<usize>,
 
     pub stop_recording_after_next_action: bool,
     pub ignore_current_insertion: bool,
@@ -451,6 +484,8 @@ impl Operator {
             Operator::Literal { .. } => "^V",
             Operator::FindForward { before: false } => "f",
             Operator::FindForward { before: true } => "t",
+            Operator::Sneak { .. } => "s",
+            Operator::SneakBackward { .. } => "S",
             Operator::FindBackward { after: false } => "F",
             Operator::FindBackward { after: true } => "T",
             Operator::AddSurrounds { .. } => "ys",
@@ -460,6 +495,8 @@ impl Operator {
             Operator::Jump { line: true } => "'",
             Operator::Jump { line: false } => "`",
             Operator::Indent => ">",
+            Operator::AutoIndent => "eq",
+            Operator::ShellCommand => "sh",
             Operator::Rewrap => "gq",
             Operator::Outdent => "<",
             Operator::Uppercase => "gU",
@@ -480,6 +517,8 @@ impl Operator {
             Operator::Literal {
                 prefix: Some(prefix),
             } => format!("^V{prefix}"),
+            Operator::AutoIndent => "=".to_string(),
+            Operator::ShellCommand => "=".to_string(),
             _ => self.id().to_string(),
         }
     }
@@ -491,6 +530,8 @@ impl Operator {
             | Operator::Mark
             | Operator::Jump { .. }
             | Operator::FindBackward { .. }
+            | Operator::Sneak { .. }
+            | Operator::SneakBackward { .. }
             | Operator::Register
             | Operator::RecordRegister
             | Operator::ReplayRegister
@@ -505,6 +546,8 @@ impl Operator {
             | Operator::Rewrap
             | Operator::Indent
             | Operator::Outdent
+            | Operator::AutoIndent
+            | Operator::ShellCommand
             | Operator::Lowercase
             | Operator::Uppercase
             | Operator::Object { .. }

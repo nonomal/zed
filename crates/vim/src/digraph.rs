@@ -3,6 +3,7 @@ use std::sync::Arc;
 use collections::HashMap;
 use editor::Editor;
 use gpui::{impl_actions, AppContext, Keystroke, KeystrokeEvent};
+use schemars::JsonSchema;
 use serde::Deserialize;
 use settings::Settings;
 use std::sync::LazyLock;
@@ -12,7 +13,7 @@ use crate::{state::Operator, Vim, VimSettings};
 
 mod default;
 
-#[derive(PartialEq, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema, PartialEq)]
 struct Literal(String, char);
 impl_actions!(vim, [Literal]);
 
@@ -83,7 +84,7 @@ impl Vim {
         cx: &mut ViewContext<Self>,
     ) {
         // handled by handle_literal_input
-        if keystroke_event.keystroke.ime_key.is_some() {
+        if keystroke_event.keystroke.key_char.is_some() {
             return;
         };
 

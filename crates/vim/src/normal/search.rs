@@ -1,10 +1,10 @@
-use std::{iter::Peekable, str::Chars, time::Duration};
-
 use editor::Editor;
-use gpui::{actions, impl_actions, ViewContext};
+use gpui::{actions, impl_actions, impl_internal_actions, ViewContext};
 use language::Point;
+use schemars::JsonSchema;
 use search::{buffer_search, BufferSearchBar, SearchOptions};
 use serde_derive::Deserialize;
+use std::{iter::Peekable, str::Chars, time::Duration};
 use util::serde::default_true;
 use workspace::{notifications::NotifyResultExt, searchable::Direction};
 
@@ -15,7 +15,7 @@ use crate::{
     Vim,
 };
 
-#[derive(Clone, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MoveToNext {
     #[serde(default = "default_true")]
@@ -26,7 +26,7 @@ pub(crate) struct MoveToNext {
     regex: bool,
 }
 
-#[derive(Clone, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MoveToPrev {
     #[serde(default = "default_true")]
@@ -37,7 +37,7 @@ pub(crate) struct MoveToPrev {
     regex: bool,
 }
 
-#[derive(Clone, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq)]
 pub(crate) struct Search {
     #[serde(default)]
     backwards: bool,
@@ -45,19 +45,19 @@ pub(crate) struct Search {
     regex: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq)]
 pub struct FindCommand {
     pub query: String,
     pub backwards: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ReplaceCommand {
     pub(crate) range: CommandRange,
     pub(crate) replacement: Replacement,
 }
 
-#[derive(Debug, Default, PartialEq, Deserialize, Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Replacement {
     search: String,
     replacement: String,
@@ -66,10 +66,8 @@ pub(crate) struct Replacement {
 }
 
 actions!(vim, [SearchSubmit, MoveToNextMatch, MoveToPrevMatch]);
-impl_actions!(
-    vim,
-    [FindCommand, ReplaceCommand, Search, MoveToPrev, MoveToNext]
-);
+impl_actions!(vim, [FindCommand, Search, MoveToPrev, MoveToNext]);
+impl_internal_actions!(vim, [ReplaceCommand]);
 
 pub(crate) fn register(editor: &mut Editor, cx: &mut ViewContext<Vim>) {
     Vim::action(editor, cx, Vim::move_to_next);
@@ -120,7 +118,7 @@ impl Vim {
         } else {
             Direction::Next
         };
-        let count = self.take_count(cx).unwrap_or(1);
+        let count = Vim::take_count(cx).unwrap_or(1);
         let prior_selections = self.editor_selections(cx);
         pane.update(cx, |pane, cx| {
             if let Some(search_bar) = pane.toolbar().read(cx).item_of_type::<BufferSearchBar>() {
@@ -226,7 +224,7 @@ impl Vim {
 
     pub fn move_to_match_internal(&mut self, direction: Direction, cx: &mut ViewContext<Self>) {
         let Some(pane) = self.pane(cx) else { return };
-        let count = self.take_count(cx).unwrap_or(1);
+        let count = Vim::take_count(cx).unwrap_or(1);
         let prior_selections = self.editor_selections(cx);
 
         let success = pane.update(cx, |pane, cx| {
@@ -264,7 +262,7 @@ impl Vim {
         cx: &mut ViewContext<Self>,
     ) {
         let Some(pane) = self.pane(cx) else { return };
-        let count = self.take_count(cx).unwrap_or(1);
+        let count = Vim::take_count(cx).unwrap_or(1);
         let prior_selections = self.editor_selections(cx);
         let vim = cx.view().clone();
 

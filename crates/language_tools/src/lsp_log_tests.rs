@@ -57,7 +57,7 @@ async fn test_lsp_logs(cx: &mut TestAppContext) {
 
     let _rust_buffer = project
         .update(cx, |project, cx| {
-            project.open_local_buffer("/the-root/test.rs", cx)
+            project.open_local_buffer_with_lsp("/the-root/test.rs", cx)
         })
         .await
         .unwrap();
@@ -71,7 +71,7 @@ async fn test_lsp_logs(cx: &mut TestAppContext) {
     let log_view = window.root(cx).unwrap();
     let mut cx = VisualTestContext::from_window(*window, cx);
 
-    language_server.notify::<lsp::notification::LogMessage>(lsp::LogMessageParams {
+    language_server.notify::<lsp::notification::LogMessage>(&lsp::LogMessageParams {
         message: "hello from the server".into(),
         typ: lsp::MessageType::INFO,
     });

@@ -1,28 +1,22 @@
-use crate::slash_command::file_command::codeblock_fence_for_path;
-use crate::slash_command_working_set::SlashCommandWorkingSet;
-use crate::ToolWorkingSet;
 use crate::{
-    assistant_settings::{AssistantDockPosition, AssistantSettings},
-    humanize_token_count,
-    prompt_library::open_prompt_library,
-    prompts::PromptBuilder,
-    slash_command::{
-        default_command::DefaultSlashCommand,
-        docs_command::{DocsSlashCommand, DocsSlashCommandArgs},
-        file_command, SlashCommandCompletionProvider,
-    },
-    slash_command_picker,
-    terminal_inline_assistant::TerminalInlineAssistant,
-    Assist, AssistantPatch, AssistantPatchStatus, CacheStatus, ConfirmCommand, Content, Context,
-    ContextEvent, ContextId, ContextStore, ContextStoreEvent, CopyCode, CycleMessageRole,
-    DeployHistory, DeployPromptLibrary, Edit, InlineAssistant, InsertDraggedFiles,
-    InsertIntoEditor, InvokedSlashCommandId, InvokedSlashCommandStatus, Message, MessageId,
-    MessageMetadata, MessageStatus, ModelPickerDelegate, ModelSelector, NewContext,
-    ParsedSlashCommand, PendingSlashCommandStatus, QuoteSelection, RemoteContextMetadata,
-    RequestType, SavedContextMetadata, Split, ToggleFocus, ToggleModelSelector,
+    humanize_token_count, slash_command::SlashCommandCompletionProvider, slash_command_picker,
+    terminal_inline_assistant::TerminalInlineAssistant, Assist, AssistantPatch,
+    AssistantPatchStatus, CacheStatus, ConfirmCommand, Content, Context, ContextEvent, ContextId,
+    ContextStore, ContextStoreEvent, CopyCode, CycleMessageRole, DeployHistory,
+    DeployPromptLibrary, Edit, InlineAssistant, InsertDraggedFiles, InsertIntoEditor,
+    InvokedSlashCommandId, InvokedSlashCommandStatus, Message, MessageId, MessageMetadata,
+    MessageStatus, NewContext, ParsedSlashCommand, PendingSlashCommandStatus, QuoteSelection,
+    RemoteContextMetadata, RequestType, SavedContextMetadata, Split, ToggleFocus,
+    ToggleModelSelector,
 };
 use anyhow::Result;
-use assistant_slash_command::{SlashCommand, SlashCommandOutputSection};
+use assistant_settings::{AssistantDockPosition, AssistantSettings};
+use assistant_slash_command::{SlashCommand, SlashCommandOutputSection, SlashCommandWorkingSet};
+use assistant_slash_commands::{
+    selections_creases, DefaultSlashCommand, DocsSlashCommand, DocsSlashCommandArgs,
+    FileSlashCommand,
+};
+use assistant_tool::ToolWorkingSet;
 use client::{proto, zed_urls, Client, Status};
 use collections::{hash_map, BTreeSet, HashMap, HashSet};
 use editor::{
@@ -50,15 +44,17 @@ use indexed_docs::IndexedDocsStore;
 use language::{
     language_settings::SoftWrap, BufferSnapshot, LanguageRegistry, LspAdapterDelegate, ToOffset,
 };
-use language_model::{
-    provider::cloud::PROVIDER_ID, LanguageModelProvider, LanguageModelProviderId,
-    LanguageModelRegistry, Role,
-};
 use language_model::{LanguageModelImage, LanguageModelToolUse};
+use language_model::{
+    LanguageModelProvider, LanguageModelProviderId, LanguageModelRegistry, Role,
+    ZED_CLOUD_PROVIDER_ID,
+};
+use language_model_selector::{LanguageModelSelector, LanguageModelSelectorPopoverMenu};
 use multi_buffer::MultiBufferRow;
 use picker::{Picker, PickerDelegate};
 use project::lsp_store::LocalLspAdapterDelegate;
 use project::{Project, Worktree};
+use prompt_library::{open_prompt_library, PromptBuilder, PromptLibrary};
 use rope::Point;
 use search::{buffer_search::DivRegistrar, BufferSearchBar};
 use serde::{Deserialize, Serialize};
@@ -107,7 +103,6 @@ pub fn init(cx: &mut AppContext) {
 
                     workspace.toggle_panel_focus::<AssistantPanel>(cx);
                 })
-                .register_action(AssistantPanel::inline_assist)
                 .register_action(ContextEditor::quote_selection)
                 .register_action(ContextEditor::insert_selection)
                 .register_action(ContextEditor::copy_code)
@@ -122,7 +117,7 @@ pub fn init(cx: &mut AppContext) {
     cx.observe_new_views(
         |terminal_panel: &mut TerminalPanel, cx: &mut ViewContext<TerminalPanel>| {
             let settings = AssistantSettings::get_global(cx);
-            terminal_panel.asssistant_enabled(settings.enabled, cx);
+            terminal_panel.set_assistant_enabled(settings.enabled, cx);
         },
     )
     .detach();
@@ -142,7 +137,7 @@ pub struct AssistantPanel {
     languages: Arc<LanguageRegistry>,
     fs: Arc<dyn Fs>,
     subscriptions: Vec<Subscription>,
-    model_selector_menu_handle: PopoverMenuHandle<Picker<ModelPickerDelegate>>,
+    model_selector_menu_handle: PopoverMenuHandle<LanguageModelSelector>,
     model_summary_editor: View<Editor>,
     authenticate_provider_task: Option<(LanguageModelProviderId, Task<()>)>,
     configuration_subscription: Option<Subscription>,
@@ -304,7 +299,7 @@ impl PickerDelegate for SavedContextPickerDelegate {
             ListItem::new(ix)
                 .inset(true)
                 .spacing(ListItemSpacing::Sparse)
-                .selected(selected)
+                .toggle_state(selected)
                 .child(item),
         )
     }
@@ -340,11 +335,12 @@ impl AssistantPanel {
     ) -> Self {
         let model_selector_menu_handle = PopoverMenuHandle::default();
         let model_summary_editor = cx.new_view(Editor::single_line);
-        let context_editor_toolbar = cx.new_view(|_| {
+        let context_editor_toolbar = cx.new_view(|cx| {
             ContextEditorToolbarItem::new(
                 workspace,
                 model_selector_menu_handle.clone(),
                 model_summary_editor.clone(),
+                cx,
             )
         });
 
@@ -415,7 +411,6 @@ impl AssistantPanel {
                 ControlFlow::Break(())
             });
 
-            pane.set_can_split(false, cx);
             pane.set_can_navigate(true, cx);
             pane.display_nav_history_buttons(None);
             pane.set_should_display_tab_bar(|_| true);
@@ -441,7 +436,7 @@ impl AssistantPanel {
                             )
                         }
                     })
-                    .selected(
+                    .toggle_state(
                         pane.active_item()
                             .map_or(false, |item| item.downcast::<ContextHistory>().is_some()),
                     );
@@ -450,6 +445,7 @@ impl AssistantPanel {
                     .gap(DynamicSpacing::Base02.rems(cx))
                     .child(
                         IconButton::new("new-chat", IconName::Plus)
+                            .icon_size(IconSize::Small)
                             .on_click(
                                 cx.listener(|_, _, cx| {
                                     cx.dispatch_action(NewContext.boxed_clone())
@@ -594,7 +590,7 @@ impl AssistantPanel {
                 true
             }
 
-            pane::Event::ActivateItem { local } => {
+            pane::Event::ActivateItem { local, .. } => {
                 if *local {
                     self.workspace
                         .update(cx, |workspace, cx| {
@@ -664,7 +660,7 @@ impl AssistantPanel {
         // If we're signed out and don't have a provider configured, or we're signed-out AND Zed.dev is
         // the provider, we want to show a nudge to sign in.
         let show_zed_ai_notice = client_status.is_signed_out()
-            && active_provider.map_or(true, |provider| provider.id().0 == PROVIDER_ID);
+            && active_provider.map_or(true, |provider| provider.id().0 == ZED_CLOUD_PROVIDER_ID);
 
         self.show_zed_ai_notice = show_zed_ai_notice;
         cx.notify();
@@ -1189,7 +1185,19 @@ impl AssistantPanel {
     }
 
     fn deploy_prompt_library(&mut self, _: &DeployPromptLibrary, cx: &mut ViewContext<Self>) {
-        open_prompt_library(self.languages.clone(), cx).detach_and_log_err(cx);
+        open_prompt_library(
+            self.languages.clone(),
+            Box::new(PromptLibraryInlineAssist),
+            Arc::new(|| {
+                Box::new(SlashCommandCompletionProvider::new(
+                    Arc::new(SlashCommandWorkingSet::default()),
+                    None,
+                    None,
+                ))
+            }),
+            cx,
+        )
+        .detach_and_log_err(cx);
     }
 
     fn toggle_model_selector(&mut self, _: &ToggleModelSelector, cx: &mut ViewContext<Self>) {
@@ -1315,7 +1323,7 @@ impl AssistantPanel {
 
     fn restart_context_servers(
         workspace: &mut Workspace,
-        _action: &context_servers::Restart,
+        _action: &context_server::Restart,
         cx: &mut ViewContext<Workspace>,
     ) {
         let Some(assistant_panel) = workspace.panel::<AssistantPanel>(cx) else {
@@ -1457,6 +1465,10 @@ impl Panel for AssistantPanel {
     fn toggle_action(&self) -> Box<dyn Action> {
         Box::new(ToggleFocus)
     }
+
+    fn activation_priority(&self) -> u32 {
+        4
+    }
 }
 
 impl EventEmitter<PanelEvent> for AssistantPanel {}
@@ -1465,6 +1477,29 @@ impl EventEmitter<AssistantPanelEvent> for AssistantPanel {}
 impl FocusableView for AssistantPanel {
     fn focus_handle(&self, cx: &AppContext) -> FocusHandle {
         self.pane.focus_handle(cx)
+    }
+}
+
+struct PromptLibraryInlineAssist;
+
+impl prompt_library::InlineAssistDelegate for PromptLibraryInlineAssist {
+    fn assist(
+        &self,
+        prompt_editor: &View<Editor>,
+        initial_prompt: Option<String>,
+        cx: &mut ViewContext<PromptLibrary>,
+    ) {
+        InlineAssistant::update_global(cx, |assistant, cx| {
+            assistant.assist(&prompt_editor, None, None, initial_prompt, cx)
+        })
+    }
+
+    fn focus_assistant_panel(
+        &self,
+        workspace: &mut Workspace,
+        cx: &mut ViewContext<Workspace>,
+    ) -> bool {
+        workspace.focus_panel::<AssistantPanel>(cx).is_some()
     }
 }
 
@@ -1555,6 +1590,7 @@ impl ContextEditor {
             let mut editor = Editor::for_buffer(context.read(cx).buffer().clone(), None, cx);
             editor.set_soft_wrap_mode(SoftWrap::EditorWidth, cx);
             editor.set_show_line_numbers(false, cx);
+            editor.set_show_scrollbars(false, cx);
             editor.set_show_git_diff_gutter(false, cx);
             editor.set_show_code_actions(false, cx);
             editor.set_show_runnables(false, cx);
@@ -1924,7 +1960,7 @@ impl ContextEditor {
                                     Content::ToolUse {
                                         range: tool_use.source_range.clone(),
                                         tool_use: LanguageModelToolUse {
-                                            id: tool_use.id.to_string(),
+                                            id: tool_use.id.clone(),
                                             name: tool_use.name.clone(),
                                             input: tool_use.input.clone(),
                                         },
@@ -2050,30 +2086,6 @@ impl ContextEditor {
             ContextEvent::SlashCommandOutputSectionAdded { section } => {
                 self.insert_slash_command_output_sections([section.clone()], false, cx);
             }
-            ContextEvent::SlashCommandFinished {
-                output_range: _output_range,
-                run_commands_in_ranges,
-            } => {
-                for range in run_commands_in_ranges {
-                    let commands = self.context.update(cx, |context, cx| {
-                        context.reparse(cx);
-                        context
-                            .pending_commands_for_range(range.clone(), cx)
-                            .to_vec()
-                    });
-
-                    for command in commands {
-                        self.run_command(
-                            command.source_range,
-                            &command.name,
-                            &command.arguments,
-                            false,
-                            self.workspace.clone(),
-                            cx,
-                        );
-                    }
-                }
-            }
             ContextEvent::UsePendingTools => {
                 let pending_tool_uses = self
                     .context
@@ -2152,6 +2164,37 @@ impl ContextEditor {
         command_id: InvokedSlashCommandId,
         cx: &mut ViewContext<Self>,
     ) {
+        if let Some(invoked_slash_command) =
+            self.context.read(cx).invoked_slash_command(&command_id)
+        {
+            if let InvokedSlashCommandStatus::Finished = invoked_slash_command.status {
+                let run_commands_in_ranges = invoked_slash_command
+                    .run_commands_in_ranges
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for range in run_commands_in_ranges {
+                    let commands = self.context.update(cx, |context, cx| {
+                        context.reparse(cx);
+                        context
+                            .pending_commands_for_range(range.clone(), cx)
+                            .to_vec()
+                    });
+
+                    for command in commands {
+                        self.run_command(
+                            command.source_range,
+                            &command.name,
+                            &command.arguments,
+                            false,
+                            self.workspace.clone(),
+                            cx,
+                        );
+                    }
+                }
+            }
+        }
+
         self.editor.update(cx, |editor, cx| {
             if let Some(invoked_slash_command) =
                 self.context.read(cx).invoked_slash_command(&command_id)
@@ -3020,7 +3063,7 @@ impl ContextEditor {
 
         cx.spawn(|_, mut cx| async move {
             let (paths, dragged_file_worktrees) = paths.await;
-            let cmd_name = file_command::FileSlashCommand.name();
+            let cmd_name = FileSlashCommand.name();
 
             context_editor_view
                 .update(&mut cx, |context_editor, cx| {
@@ -3641,7 +3684,7 @@ impl ContextEditor {
 
         let (style, tooltip) = match token_state(&self.context, cx) {
             Some(TokenState::NoTokensLeft { .. }) => (
-                ButtonStyle::Tinted(TintColor::Negative),
+                ButtonStyle::Tinted(TintColor::Error),
                 Some(Tooltip::text("Token limit reached", cx)),
             ),
             Some(TokenState::HasMoreTokens {
@@ -3698,7 +3741,7 @@ impl ContextEditor {
 
         let (style, tooltip) = match token_state(&self.context, cx) {
             Some(TokenState::NoTokensLeft { .. }) => (
-                ButtonStyle::Tinted(TintColor::Negative),
+                ButtonStyle::Tinted(TintColor::Error),
                 Some(Tooltip::text("Token limit reached", cx)),
             ),
             Some(TokenState::HasMoreTokens {
@@ -3982,99 +4025,6 @@ fn find_surrounding_code_block(snapshot: &BufferSnapshot, offset: usize) -> Opti
     None
 }
 
-pub fn selections_creases(
-    workspace: &mut workspace::Workspace,
-    cx: &mut ViewContext<Workspace>,
-) -> Option<Vec<(String, String)>> {
-    let editor = workspace
-        .active_item(cx)
-        .and_then(|item| item.act_as::<Editor>(cx))?;
-
-    let mut creases = vec![];
-    editor.update(cx, |editor, cx| {
-        let selections = editor.selections.all_adjusted(cx);
-        let buffer = editor.buffer().read(cx).snapshot(cx);
-        for selection in selections {
-            let range = editor::ToOffset::to_offset(&selection.start, &buffer)
-                ..editor::ToOffset::to_offset(&selection.end, &buffer);
-            let selected_text = buffer.text_for_range(range.clone()).collect::<String>();
-            if selected_text.is_empty() {
-                continue;
-            }
-            let start_language = buffer.language_at(range.start);
-            let end_language = buffer.language_at(range.end);
-            let language_name = if start_language == end_language {
-                start_language.map(|language| language.code_fence_block_name())
-            } else {
-                None
-            };
-            let language_name = language_name.as_deref().unwrap_or("");
-            let filename = buffer
-                .file_at(selection.start)
-                .map(|file| file.full_path(cx));
-            let text = if language_name == "markdown" {
-                selected_text
-                    .lines()
-                    .map(|line| format!("> {}", line))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            } else {
-                let start_symbols = buffer
-                    .symbols_containing(selection.start, None)
-                    .map(|(_, symbols)| symbols);
-                let end_symbols = buffer
-                    .symbols_containing(selection.end, None)
-                    .map(|(_, symbols)| symbols);
-
-                let outline_text =
-                    if let Some((start_symbols, end_symbols)) = start_symbols.zip(end_symbols) {
-                        Some(
-                            start_symbols
-                                .into_iter()
-                                .zip(end_symbols)
-                                .take_while(|(a, b)| a == b)
-                                .map(|(a, _)| a.text)
-                                .collect::<Vec<_>>()
-                                .join(" > "),
-                        )
-                    } else {
-                        None
-                    };
-
-                let line_comment_prefix = start_language
-                    .and_then(|l| l.default_scope().line_comment_prefixes().first().cloned());
-
-                let fence = codeblock_fence_for_path(
-                    filename.as_deref(),
-                    Some(selection.start.row..=selection.end.row),
-                );
-
-                if let Some((line_comment_prefix, outline_text)) =
-                    line_comment_prefix.zip(outline_text)
-                {
-                    let breadcrumb = format!("{line_comment_prefix}Excerpt from: {outline_text}\n");
-                    format!("{fence}{breadcrumb}{selected_text}\n```")
-                } else {
-                    format!("{fence}{selected_text}\n```")
-                }
-            };
-            let crease_title = if let Some(path) = filename {
-                let start_line = selection.start.row + 1;
-                let end_line = selection.end.row + 1;
-                if start_line == end_line {
-                    format!("{}, Line {}", path.display(), start_line)
-                } else {
-                    format!("{}, Lines {} to {}", path.display(), start_line, end_line)
-                }
-            } else {
-                "Quoted selection".to_string()
-            };
-            creases.push((text, crease_title));
-        }
-    });
-    Some(creases)
-}
-
 fn render_fold_icon_button(
     editor: WeakView<Editor>,
     icon: IconName,
@@ -4258,6 +4208,10 @@ impl Item for ContextEditor {
         } else {
             None
         }
+    }
+
+    fn include_in_nav_history() -> bool {
+        false
     }
 }
 
@@ -4447,23 +4401,36 @@ impl FollowableItem for ContextEditor {
 }
 
 pub struct ContextEditorToolbarItem {
-    fs: Arc<dyn Fs>,
     active_context_editor: Option<WeakView<ContextEditor>>,
     model_summary_editor: View<Editor>,
-    model_selector_menu_handle: PopoverMenuHandle<Picker<ModelPickerDelegate>>,
+    language_model_selector: View<LanguageModelSelector>,
+    language_model_selector_menu_handle: PopoverMenuHandle<LanguageModelSelector>,
 }
 
 impl ContextEditorToolbarItem {
     pub fn new(
         workspace: &Workspace,
-        model_selector_menu_handle: PopoverMenuHandle<Picker<ModelPickerDelegate>>,
+        model_selector_menu_handle: PopoverMenuHandle<LanguageModelSelector>,
         model_summary_editor: View<Editor>,
+        cx: &mut ViewContext<Self>,
     ) -> Self {
         Self {
-            fs: workspace.app_state().fs.clone(),
             active_context_editor: None,
             model_summary_editor,
-            model_selector_menu_handle,
+            language_model_selector: cx.new_view(|cx| {
+                let fs = workspace.app_state().fs.clone();
+                LanguageModelSelector::new(
+                    move |model, cx| {
+                        update_settings_file::<AssistantSettings>(
+                            fs.clone(),
+                            cx,
+                            move |settings, _| settings.set_model(model.clone()),
+                        );
+                    },
+                    cx,
+                )
+            }),
+            language_model_selector_menu_handle: model_selector_menu_handle,
         }
     }
 
@@ -4552,8 +4519,8 @@ impl Render for ContextEditorToolbarItem {
             //         .map(|remaining_items| format!("Files to scan: {}", remaining_items))
             // })
             .child(
-                ModelSelector::new(
-                    self.fs.clone(),
+                LanguageModelSelectorPopoverMenu::new(
+                    self.language_model_selector.clone(),
                     ButtonLike::new("active-model")
                         .style(ButtonStyle::Subtle)
                         .child(
@@ -4599,7 +4566,7 @@ impl Render for ContextEditorToolbarItem {
                             Tooltip::for_action("Change Model", &ToggleModelSelector, cx)
                         }),
                 )
-                .with_handle(self.model_selector_menu_handle.clone()),
+                .with_handle(self.language_model_selector_menu_handle.clone()),
             )
             .children(self.render_remaining_tokens(cx));
 
@@ -4934,7 +4901,7 @@ fn render_slash_command_output_toggle(
         ("slash-command-output-fold-indicator", row.0 as u64),
         !is_folded,
     )
-    .selected(is_folded)
+    .toggle_state(is_folded)
     .on_click(move |_e, cx| fold(!is_folded, cx))
     .into_any_element()
 }
@@ -4944,12 +4911,12 @@ fn fold_toggle(
 ) -> impl Fn(
     MultiBufferRow,
     bool,
-    Arc<dyn Fn(bool, &mut WindowContext<'_>) + Send + Sync>,
-    &mut WindowContext<'_>,
+    Arc<dyn Fn(bool, &mut WindowContext) + Send + Sync>,
+    &mut WindowContext,
 ) -> AnyElement {
     move |row, is_folded, fold, _cx| {
         Disclosure::new((name, row.0 as u64), !is_folded)
-            .selected(is_folded)
+            .toggle_state(is_folded)
             .on_click(move |_e, cx| fold(!is_folded, cx))
             .into_any_element()
     }
@@ -4991,7 +4958,7 @@ fn render_quote_selection_output_toggle(
     _cx: &mut WindowContext,
 ) -> AnyElement {
     Disclosure::new(("quote-selection-indicator", row.0 as u64), !is_folded)
-        .selected(is_folded)
+        .toggle_state(is_folded)
         .on_click(move |_e, cx| fold(!is_folded, cx))
         .into_any_element()
 }
@@ -5014,7 +4981,7 @@ fn render_pending_slash_command_gutter_decoration(
             icon = icon.icon_color(Color::Muted);
         }
         PendingSlashCommandStatus::Running { .. } => {
-            icon = icon.selected(true);
+            icon = icon.toggle_state(true);
         }
         PendingSlashCommandStatus::Error(_) => icon = icon.icon_color(Color::Error),
     }
@@ -5096,9 +5063,11 @@ fn make_lsp_adapter_delegate(
             return Ok(None::<Arc<dyn LspAdapterDelegate>>);
         };
         let http_client = project.client().http_client().clone();
-        project.lsp_store().update(cx, |lsp_store, cx| {
+        project.lsp_store().update(cx, |_, cx| {
             Ok(Some(LocalLspAdapterDelegate::new(
-                lsp_store,
+                project.languages().clone(),
+                project.environment(),
+                cx.weak_model(),
                 &worktree,
                 http_client,
                 project.fs().clone(),

@@ -1,5 +1,5 @@
 #![allow(missing_docs)]
-use crate::prelude::*;
+use crate::{prelude::*, KeyBinding};
 use gpui::{AnyElement, SharedString};
 
 /// Which side of the preview to show labels on
@@ -30,20 +30,20 @@ pub trait ComponentPreview: IntoElement {
         ExampleLabelSide::default()
     }
 
-    fn examples(_cx: &WindowContext) -> Vec<ComponentExampleGroup<Self>>;
+    fn examples(_cx: &mut WindowContext) -> Vec<ComponentExampleGroup<Self>>;
 
     fn custom_example(_cx: &WindowContext) -> impl Into<Option<AnyElement>> {
         None::<AnyElement>
     }
 
-    fn component_previews(cx: &WindowContext) -> Vec<AnyElement> {
+    fn component_previews(cx: &mut WindowContext) -> Vec<AnyElement> {
         Self::examples(cx)
             .into_iter()
             .map(|example| Self::render_example_group(example))
             .collect()
     }
 
-    fn render_component_previews(cx: &WindowContext) -> AnyElement {
+    fn render_component_previews(cx: &mut WindowContext) -> AnyElement {
         let title = Self::title();
         let (source, title) = title
             .rsplit_once("::")
@@ -197,4 +197,8 @@ pub fn example_group_with_title<T>(
     examples: Vec<ComponentExample<T>>,
 ) -> ComponentExampleGroup<T> {
     ComponentExampleGroup::with_title(title, examples)
+}
+
+pub fn theme_preview_keybinding(keystrokes: &str) -> KeyBinding {
+    KeyBinding::new(gpui::KeyBinding::new(keystrokes, gpui::NoAction {}, None))
 }

@@ -39,6 +39,36 @@ pub trait FeatureFlag {
     }
 }
 
+pub struct Assistant2FeatureFlag;
+
+impl FeatureFlag for Assistant2FeatureFlag {
+    const NAME: &'static str = "assistant2";
+
+    fn enabled_for_staff() -> bool {
+        false
+    }
+}
+
+pub struct ToolUseFeatureFlag;
+
+impl FeatureFlag for ToolUseFeatureFlag {
+    const NAME: &'static str = "assistant-tool-use";
+
+    fn enabled_for_staff() -> bool {
+        false
+    }
+}
+
+pub struct PredictEditsFeatureFlag;
+impl FeatureFlag for PredictEditsFeatureFlag {
+    const NAME: &'static str = "predict-edits";
+}
+
+pub struct GitUiFeatureFlag;
+impl FeatureFlag for GitUiFeatureFlag {
+    const NAME: &'static str = "git-ui";
+}
+
 pub struct Remoting {}
 impl FeatureFlag for Remoting {
     const NAME: &'static str = "remoting";

@@ -7,7 +7,8 @@ use anyhow::{anyhow, Context as _, Result};
 use collections::Bound;
 use feature_flags::FeatureFlagAppExt;
 use fs::Fs;
-use futures::stream::StreamExt;
+use fs::MTime;
+use futures::{stream::StreamExt, FutureExt as _};
 use futures_batch::ChunksTimeoutStreamExt;
 use gpui::{AppContext, Model, Task};
 use heed::types::{SerdeBincode, Str};
@@ -16,15 +17,7 @@ use log;
 use project::{Entry, UpdatedEntriesSet, Worktree};
 use serde::{Deserialize, Serialize};
 use smol::channel;
-use smol::future::FutureExt;
-use std::{
-    cmp::Ordering,
-    future::Future,
-    iter,
-    path::Path,
-    sync::Arc,
-    time::{Duration, SystemTime},
-};
+use std::{cmp::Ordering, future::Future, iter, path::Path, pin::pin, sync::Arc, time::Duration};
 use util::ResultExt;
 use worktree::Snapshot;
 
@@ -290,7 +283,7 @@ impl EmbeddingIndex {
         let (embedded_files_tx, embedded_files_rx) = channel::bounded(512);
         let task = cx.background_executor().spawn(async move {
             let mut chunked_file_batches =
-                chunked_files.chunks_timeout(512, Duration::from_secs(2));
+                pin!(chunked_files.chunks_timeout(512, Duration::from_secs(2)));
             while let Some(chunked_files) = chunked_file_batches.next().await {
                 // View the batch of files as a vec of chunks
                 // Flatten out to a vec of chunks that we can subdivide into batch sized pieces
@@ -364,14 +357,16 @@ impl EmbeddingIndex {
 
     fn persist_embeddings(
         &self,
-        mut deleted_entry_ranges: channel::Receiver<(Bound<String>, Bound<String>)>,
-        mut embedded_files: channel::Receiver<(EmbeddedFile, IndexingEntryHandle)>,
+        deleted_entry_ranges: channel::Receiver<(Bound<String>, Bound<String>)>,
+        embedded_files: channel::Receiver<(EmbeddedFile, IndexingEntryHandle)>,
         cx: &AppContext,
     ) -> Task<Result<()>> {
         let db_connection = self.db_connection.clone();
         let db = self.db;
 
         cx.background_executor().spawn(async move {
+            let mut deleted_entry_ranges = pin!(deleted_entry_ranges);
+            let mut embedded_files = pin!(embedded_files);
             loop {
                 // Interleave deletions and persists of embedded files
                 futures::select_biased! {
@@ -451,7 +446,7 @@ struct ChunkFiles {
 
 pub struct ChunkedFile {
     pub path: Arc<Path>,
-    pub mtime: Option<SystemTime>,
+    pub mtime: Option<MTime>,
     pub handle: IndexingEntryHandle,
     pub text: String,
     pub chunks: Vec<Chunk>,
@@ -465,7 +460,7 @@ pub struct EmbedFiles {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EmbeddedFile {
     pub path: Arc<Path>,
-    pub mtime: Option<SystemTime>,
+    pub mtime: Option<MTime>,
     pub chunks: Vec<EmbeddedChunk>,
 }
 

@@ -164,6 +164,8 @@ async fn test_channel_messages(cx: &mut TestAppContext) {
                 id: 5,
                 github_login: "nathansobo".into(),
                 avatar_url: "http://avatar.com/nathansobo".into(),
+                name: None,
+                email: None,
             }],
         },
     );
@@ -216,6 +218,8 @@ async fn test_channel_messages(cx: &mut TestAppContext) {
                 id: 6,
                 github_login: "maxbrunsfeld".into(),
                 avatar_url: "http://avatar.com/maxbrunsfeld".into(),
+                name: None,
+                email: None,
             }],
         },
     );
@@ -259,6 +263,8 @@ async fn test_channel_messages(cx: &mut TestAppContext) {
                 id: 7,
                 github_login: "as-cii".into(),
                 avatar_url: "http://avatar.com/as-cii".into(),
+                name: None,
+                email: None,
             }],
         },
     );
@@ -343,7 +349,7 @@ fn init_test(cx: &mut AppContext) -> Model<ChannelStore> {
     release_channel::init(SemanticVersion::default(), cx);
     client::init_settings(cx);
 
-    let clock = Arc::new(FakeSystemClock::default());
+    let clock = Arc::new(FakeSystemClock::new());
     let http = FakeHttpClient::with_404_response();
     let client = Client::new(clock, http.clone(), cx);
     let user_store = cx.new_model(|cx| UserStore::new(client.clone(), cx));

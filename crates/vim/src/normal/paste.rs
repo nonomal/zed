@@ -1,16 +1,16 @@
-use std::cmp;
-
 use editor::{display_map::ToDisplayPoint, movement, scroll::Autoscroll, DisplayPoint, RowExt};
 use gpui::{impl_actions, ViewContext};
 use language::{Bias, SelectionGoal};
+use schemars::JsonSchema;
 use serde::Deserialize;
+use std::cmp;
 
 use crate::{
     state::{Mode, Register},
     Vim,
 };
 
-#[derive(Clone, Deserialize, PartialEq)]
+#[derive(Clone, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Paste {
     #[serde(default)]
@@ -25,7 +25,7 @@ impl Vim {
     pub fn paste(&mut self, action: &Paste, cx: &mut ViewContext<Self>) {
         self.record_current_action(cx);
         self.store_visual_marks(cx);
-        let count = self.take_count(cx).unwrap_or(1);
+        let count = Vim::take_count(cx).unwrap_or(1);
 
         self.update_editor(cx, |vim, editor, cx| {
             let text_layout_details = editor.text_layout_details(cx);

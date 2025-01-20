@@ -1,8 +1,10 @@
 mod extension_slash_command;
 mod slash_command_registry;
+mod slash_command_working_set;
 
 pub use crate::extension_slash_command::*;
 pub use crate::slash_command_registry::*;
+pub use crate::slash_command_working_set::*;
 use anyhow::Result;
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
@@ -18,6 +20,7 @@ use workspace::{ui::IconName, Workspace};
 
 pub fn init(cx: &mut AppContext) {
     SlashCommandRegistry::default_global(cx);
+    extension_slash_command::init(cx);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

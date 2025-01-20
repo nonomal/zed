@@ -1,9 +1,9 @@
 use crate::{
     point, prelude::*, px, size, transparent_black, Action, AnyDrag, AnyElement, AnyTooltip,
-    AnyView, AppContext, Arena, Asset, AsyncWindowContext, AvailableSpace, Bounds, BoxShadow,
-    Context, Corners, CursorStyle, Decorations, DevicePixels, DispatchActionListener,
+    AnyView, AppContext, Arena, Asset, AsyncWindowContext, AvailableSpace, Background, Bounds,
+    BoxShadow, Context, Corners, CursorStyle, Decorations, DevicePixels, DispatchActionListener,
     DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
-    FileDropEvent, Flatten, FontId, GPUSpecs, Global, GlobalElementId, GlyphId, Hsla, InputHandler,
+    FileDropEvent, Flatten, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler,
     IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent,
     KeystrokeObserver, LayoutId, LineLayoutIndex, Model, ModelContext, Modifiers,
     ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
@@ -531,7 +531,6 @@ pub struct Window {
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
-    pub(crate) focus_handles: Arc<RwLock<SlotMap<FocusId, AtomicUsize>>>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     default_prevented: bool,
@@ -809,7 +808,6 @@ impl Window {
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
             dirty_views: FxHashSet::default(),
-            focus_handles: Arc::new(RwLock::new(SlotMap::with_key())),
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
             default_prevented: true,
@@ -931,17 +929,11 @@ impl<'a> WindowContext<'a> {
         self.window.removed = true;
     }
 
-    /// Obtain a new [`FocusHandle`], which allows you to track and manipulate the keyboard focus
-    /// for elements rendered within this window.
-    pub fn focus_handle(&self) -> FocusHandle {
-        FocusHandle::new(&self.window.focus_handles)
-    }
-
     /// Obtain the currently focused [`FocusHandle`]. If no elements are focused, returns `None`.
     pub fn focused(&self) -> Option<FocusHandle> {
         self.window
             .focus
-            .and_then(|id| FocusHandle::for_id(id, &self.window.focus_handles))
+            .and_then(|id| FocusHandle::for_id(id, &self.app.focus_handles))
     }
 
     /// Move focus to the element associated with the given [`FocusHandle`].
@@ -1005,6 +997,11 @@ impl<'a> WindowContext<'a> {
     /// after it has been closed
     pub fn window_bounds(&self) -> WindowBounds {
         self.window.platform_window.window_bounds()
+    }
+
+    /// Return the `WindowBounds` excluding insets (Wayland and X11)
+    pub fn inner_window_bounds(&self) -> WindowBounds {
+        self.window.platform_window.inner_window_bounds()
     }
 
     /// Dispatch the given action on the currently focused element.
@@ -1241,7 +1238,11 @@ impl<'a> WindowContext<'a> {
     /// that currently owns the mouse cursor.
     /// On mac, this is equivalent to `is_window_active`.
     pub fn is_window_hovered(&self) -> bool {
-        if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+        if cfg!(any(
+            target_os = "windows",
+            target_os = "linux",
+            target_os = "freebsd"
+        )) {
             self.window.hovered.get()
         } else {
             self.is_window_active()
@@ -1549,49 +1550,71 @@ impl<'a> WindowContext<'a> {
     }
 
     fn prepaint_tooltip(&mut self) -> Option<AnyElement> {
-        let tooltip_request = self.window.next_frame.tooltip_requests.last().cloned()?;
-        let tooltip_request = tooltip_request.unwrap();
-        let mut element = tooltip_request.tooltip.view.clone().into_any();
-        let mouse_position = tooltip_request.tooltip.mouse_position;
-        let tooltip_size = element.layout_as_root(AvailableSpace::min_size(), self);
+        // Use indexing instead of iteration to avoid borrowing self for the duration of the loop.
+        for tooltip_request_index in (0..self.window.next_frame.tooltip_requests.len()).rev() {
+            let Some(Some(tooltip_request)) = self
+                .window
+                .next_frame
+                .tooltip_requests
+                .get(tooltip_request_index)
+                .cloned()
+            else {
+                log::error!("Unexpectedly absent TooltipRequest");
+                continue;
+            };
+            let mut element = tooltip_request.tooltip.view.clone().into_any();
+            let mouse_position = tooltip_request.tooltip.mouse_position;
+            let tooltip_size = element.layout_as_root(AvailableSpace::min_size(), self);
 
-        let mut tooltip_bounds = Bounds::new(mouse_position + point(px(1.), px(1.)), tooltip_size);
-        let window_bounds = Bounds {
-            origin: Point::default(),
-            size: self.viewport_size(),
-        };
+            let mut tooltip_bounds =
+                Bounds::new(mouse_position + point(px(1.), px(1.)), tooltip_size);
+            let window_bounds = Bounds {
+                origin: Point::default(),
+                size: self.viewport_size(),
+            };
 
-        if tooltip_bounds.right() > window_bounds.right() {
-            let new_x = mouse_position.x - tooltip_bounds.size.width - px(1.);
-            if new_x >= Pixels::ZERO {
-                tooltip_bounds.origin.x = new_x;
-            } else {
-                tooltip_bounds.origin.x = cmp::max(
-                    Pixels::ZERO,
-                    tooltip_bounds.origin.x - tooltip_bounds.right() - window_bounds.right(),
-                );
+            if tooltip_bounds.right() > window_bounds.right() {
+                let new_x = mouse_position.x - tooltip_bounds.size.width - px(1.);
+                if new_x >= Pixels::ZERO {
+                    tooltip_bounds.origin.x = new_x;
+                } else {
+                    tooltip_bounds.origin.x = cmp::max(
+                        Pixels::ZERO,
+                        tooltip_bounds.origin.x - tooltip_bounds.right() - window_bounds.right(),
+                    );
+                }
             }
-        }
 
-        if tooltip_bounds.bottom() > window_bounds.bottom() {
-            let new_y = mouse_position.y - tooltip_bounds.size.height - px(1.);
-            if new_y >= Pixels::ZERO {
-                tooltip_bounds.origin.y = new_y;
-            } else {
-                tooltip_bounds.origin.y = cmp::max(
-                    Pixels::ZERO,
-                    tooltip_bounds.origin.y - tooltip_bounds.bottom() - window_bounds.bottom(),
-                );
+            if tooltip_bounds.bottom() > window_bounds.bottom() {
+                let new_y = mouse_position.y - tooltip_bounds.size.height - px(1.);
+                if new_y >= Pixels::ZERO {
+                    tooltip_bounds.origin.y = new_y;
+                } else {
+                    tooltip_bounds.origin.y = cmp::max(
+                        Pixels::ZERO,
+                        tooltip_bounds.origin.y - tooltip_bounds.bottom() - window_bounds.bottom(),
+                    );
+                }
             }
+
+            // It's possible for an element to have an active tooltip while not being painted (e.g.
+            // via the `visible_on_hover` method). Since mouse listeners are not active in this
+            // case, instead update the tooltip's visibility here.
+            let is_visible =
+                (tooltip_request.tooltip.check_visible_and_update)(tooltip_bounds, self);
+            if !is_visible {
+                continue;
+            }
+
+            self.with_absolute_element_offset(tooltip_bounds.origin, |cx| element.prepaint(cx));
+
+            self.window.tooltip_bounds = Some(TooltipBounds {
+                id: tooltip_request.id,
+                bounds: tooltip_bounds,
+            });
+            return Some(element);
         }
-
-        self.with_absolute_element_offset(tooltip_bounds.origin, |cx| element.prepaint(cx));
-
-        self.window.tooltip_bounds = Some(TooltipBounds {
-            id: tooltip_request.id,
-            bounds: tooltip_bounds,
-        });
-        Some(element)
+        None
     }
 
     fn prepaint_deferred_draws(&mut self, deferred_draw_indices: &[usize]) {
@@ -1758,6 +1781,7 @@ impl<'a> WindowContext<'a> {
                 .iter()
                 .map(|(id, type_id)| (GlobalElementId(id.0.clone()), *type_id)),
         );
+
         window
             .text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
@@ -2271,9 +2295,7 @@ impl<'a> WindowContext<'a> {
         let content_mask = self.content_mask();
         let opacity = self.element_opacity();
         for shadow in shadows {
-            let mut shadow_bounds = bounds;
-            shadow_bounds.origin += shadow.offset;
-            shadow_bounds.dilate(shadow.spread_radius);
+            let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
             self.window.next_frame.scene.insert_primitive(Shadow {
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
@@ -2315,7 +2337,7 @@ impl<'a> WindowContext<'a> {
     /// Paint the given `Path` into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
-    pub fn paint_path(&mut self, mut path: Path<Pixels>, color: impl Into<Hsla>) {
+    pub fn paint_path(&mut self, mut path: Path<Pixels>, color: impl Into<Background>) {
         debug_assert_eq!(
             self.window.draw_phase,
             DrawPhase::Paint,
@@ -2326,7 +2348,8 @@ impl<'a> WindowContext<'a> {
         let content_mask = self.content_mask();
         let opacity = self.element_opacity();
         path.content_mask = content_mask;
-        path.color = color.into().opacity(opacity);
+        let color: Background = color.into();
+        path.color = color.opacity(opacity);
         self.window
             .next_frame
             .scene
@@ -2685,6 +2708,20 @@ impl<'a> WindowContext<'a> {
         });
     }
 
+    /// Removes an image from the sprite atlas.
+    pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
+        for frame_index in 0..data.frame_count() {
+            let params = RenderImageParams {
+                image_id: data.id,
+                frame_index,
+            };
+
+            self.window.sprite_atlas.remove(&params.clone().into());
+        }
+
+        Ok(())
+    }
+
     #[must_use]
     /// Add a node to the layout tree for the current frame. Takes the `Style` of the element for which
     /// layout is being requested, along with the layout ids of any children. This method is called during
@@ -2998,7 +3035,7 @@ impl<'a> WindowContext<'a> {
                         let event = FocusOutEvent {
                             blurred: WeakFocusHandle {
                                 id: blurred_id,
-                                handles: Arc::downgrade(&cx.window.focus_handles),
+                                handles: Arc::downgrade(&cx.app.focus_handles),
                             },
                         };
                         listener(event, cx)
@@ -3038,7 +3075,7 @@ impl<'a> WindowContext<'a> {
             return true;
         }
 
-        if let Some(input) = keystroke.ime_key {
+        if let Some(input) = keystroke.key_char {
             if let Some(mut input_handler) = self.window.platform_window.take_input_handler() {
                 input_handler.dispatch_input(&input, self);
                 self.window.platform_window.set_input_handler(input_handler);
@@ -3049,11 +3086,11 @@ impl<'a> WindowContext<'a> {
         false
     }
 
-    /// Represent this action as a key binding string, to display in the UI.
+    /// Return a key binding string for an action, to display in the UI. Uses the highest precedence
+    /// binding for the action (last binding added to the keymap).
     pub fn keystroke_text_for(&self, action: &dyn Action) -> String {
         self.bindings_for_action(action)
-            .into_iter()
-            .next()
+            .last()
             .map(|binding| {
                 binding
                     .keystrokes()
@@ -3112,7 +3149,7 @@ impl<'a> WindowContext<'a> {
                     self.window.mouse_position = position;
                     if self.active_drag.is_none() {
                         self.active_drag = Some(AnyDrag {
-                            value: Box::new(paths.clone()),
+                            value: Arc::new(paths.clone()),
                             view: self.new_view(|_| paths).into(),
                             cursor_offset: position,
                         });
@@ -3247,7 +3284,7 @@ impl<'a> WindowContext<'a> {
                 if let Some(key) = key {
                     keystroke = Some(Keystroke {
                         key: key.to_string(),
-                        ime_key: None,
+                        key_char: None,
                         modifiers: Modifiers::default(),
                     });
                 }
@@ -3462,7 +3499,7 @@ impl<'a> WindowContext<'a> {
             if !self.propagate_event {
                 continue 'replay;
             }
-            if let Some(input) = replay.keystroke.ime_key.as_ref().cloned() {
+            if let Some(input) = replay.keystroke.key_char.as_ref().cloned() {
                 if let Some(mut input_handler) = self.window.platform_window.take_input_handler() {
                     input_handler.dispatch_input(&input, self);
                     self.window.platform_window.set_input_handler(input_handler)
@@ -3706,7 +3743,8 @@ impl<'a> WindowContext<'a> {
         actions
     }
 
-    /// Returns key bindings that invoke the given action on the currently focused element.
+    /// Returns key bindings that invoke an action on the currently focused element. Bindings are
+    /// returned in the order they were added. For display, the last binding should take precedence.
     pub fn bindings_for_action(&self, action: &dyn Action) -> Vec<KeyBinding> {
         self.window
             .rendered_frame
@@ -3717,12 +3755,16 @@ impl<'a> WindowContext<'a> {
             )
     }
 
-    /// Returns key bindings that invoke the given action on the currently focused element.
+    /// Returns key bindings that invoke the given action on the currently focused element, without
+    /// checking context. Bindings are returned in the order they were added. For display, the last
+    /// binding should take precedence.
     pub fn all_bindings_for_input(&self, input: &[Keystroke]) -> Vec<KeyBinding> {
         RefCell::borrow(&self.keymap).all_bindings_for_input(input)
     }
 
-    /// Returns any bindings that would invoke the given action on the given focus handle if it were focused.
+    /// Returns any bindings that would invoke an action on the given focus handle if it were
+    /// focused. Bindings are returned in the order they were added. For display, the last binding
+    /// should take precedence.
     pub fn bindings_for_action_in(
         &self,
         action: &dyn Action,
@@ -3793,7 +3835,7 @@ impl<'a> WindowContext<'a> {
 
     /// Read information about the GPU backing this window.
     /// Currently returns None on Mac and Windows.
-    pub fn gpu_specs(&self) -> Option<GPUSpecs> {
+    pub fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.window.platform_window.gpu_specs()
     }
 }
@@ -4416,7 +4458,7 @@ impl<'a, V: 'static> ViewContext<'a, V> {
                             let event = FocusOutEvent {
                                 blurred: WeakFocusHandle {
                                     id: blurred_id,
-                                    handles: Arc::downgrade(&cx.window.focus_handles),
+                                    handles: Arc::downgrade(&cx.app.focus_handles),
                                 },
                             };
                             listener(view, event, cx)
@@ -4852,6 +4894,8 @@ pub enum ElementId {
     FocusHandle(FocusId),
     /// A combination of a name and an integer.
     NamedInteger(SharedString, usize),
+    /// A path
+    Path(Arc<std::path::Path>),
 }
 
 impl Display for ElementId {
@@ -4863,6 +4907,7 @@ impl Display for ElementId {
             ElementId::FocusHandle(_) => write!(f, "FocusHandle")?,
             ElementId::NamedInteger(s, i) => write!(f, "{}-{}", s, i)?,
             ElementId::Uuid(uuid) => write!(f, "{}", uuid)?,
+            ElementId::Path(path) => write!(f, "{}", path.display())?,
         }
 
         Ok(())
@@ -4896,6 +4941,12 @@ impl From<i32> for ElementId {
 impl From<SharedString> for ElementId {
     fn from(name: SharedString) -> Self {
         ElementId::Name(name)
+    }
+}
+
+impl From<Arc<std::path::Path>> for ElementId {
+    fn from(path: Arc<std::path::Path>) -> Self {
+        ElementId::Path(path)
     }
 }
 
@@ -4956,7 +5007,7 @@ pub struct PaintQuad {
     /// The radii of the quad's corners.
     pub corner_radii: Corners<Pixels>,
     /// The background color of the quad.
-    pub background: Hsla,
+    pub background: Background,
     /// The widths of the quad's borders.
     pub border_widths: Edges<Pixels>,
     /// The color of the quad's borders.
@@ -4989,7 +5040,7 @@ impl PaintQuad {
     }
 
     /// Sets the background color of the quad.
-    pub fn background(self, background: impl Into<Hsla>) -> Self {
+    pub fn background(self, background: impl Into<Background>) -> Self {
         PaintQuad {
             background: background.into(),
             ..self
@@ -5001,7 +5052,7 @@ impl PaintQuad {
 pub fn quad(
     bounds: Bounds<Pixels>,
     corner_radii: impl Into<Corners<Pixels>>,
-    background: impl Into<Hsla>,
+    background: impl Into<Background>,
     border_widths: impl Into<Edges<Pixels>>,
     border_color: impl Into<Hsla>,
 ) -> PaintQuad {
@@ -5015,7 +5066,7 @@ pub fn quad(
 }
 
 /// Creates a filled quad with the given bounds and background color.
-pub fn fill(bounds: impl Into<Bounds<Pixels>>, background: impl Into<Hsla>) -> PaintQuad {
+pub fn fill(bounds: impl Into<Bounds<Pixels>>, background: impl Into<Background>) -> PaintQuad {
     PaintQuad {
         bounds: bounds.into(),
         corner_radii: (0.).into(),
@@ -5030,7 +5081,7 @@ pub fn outline(bounds: impl Into<Bounds<Pixels>>, border_color: impl Into<Hsla>)
     PaintQuad {
         bounds: bounds.into(),
         corner_radii: (0.).into(),
-        background: transparent_black(),
+        background: transparent_black().into(),
         border_widths: (1.).into(),
         border_color: border_color.into(),
     }

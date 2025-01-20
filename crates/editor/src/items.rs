@@ -2,14 +2,14 @@ use crate::{
     editor_settings::SeedQuerySetting,
     persistence::{SerializedEditor, DB},
     scroll::ScrollAnchor,
-    Anchor, Autoscroll, Editor, EditorEvent, EditorSettings, ExcerptId, ExcerptRange, MultiBuffer,
-    MultiBufferSnapshot, NavigationData, SearchWithinRange, ToPoint as _,
+    Anchor, Autoscroll, Editor, EditorEvent, EditorSettings, ExcerptId, ExcerptRange, FormatTarget,
+    MultiBuffer, MultiBufferSnapshot, NavigationData, SearchWithinRange, ToPoint as _,
 };
 use anyhow::{anyhow, Context as _, Result};
 use collections::HashSet;
 use file_icons::FileIcons;
 use futures::future::try_join_all;
-use git::repository::GitFileStatus;
+use git::status::GitSummary;
 use gpui::{
     point, AnyElement, AppContext, AsyncWindowContext, Context, Entity, EntityId, EventEmitter,
     IntoElement, Model, ParentElement, Pixels, SharedString, Styled, Task, View, ViewContext,
@@ -22,14 +22,11 @@ use language::{
 use lsp::DiagnosticSeverity;
 use multi_buffer::AnchorRangeExt;
 use project::{
-    lsp_store::FormatTrigger, project_settings::ProjectSettings, search::SearchQuery, Item as _,
-    Project, ProjectPath,
+    lsp_store::FormatTrigger, project_settings::ProjectSettings, search::SearchQuery, Project,
+    ProjectItem as _, ProjectPath,
 };
 use rpc::proto::{self, update_view, PeerId};
 use settings::Settings;
-use workspace::item::{Dedup, ItemSettings, SerializableItem, TabContentParams};
-
-use project::lsp_store::FormatTarget;
 use std::{
     any::TypeId,
     borrow::Cow,
@@ -44,10 +41,11 @@ use theme::{Theme, ThemeSettings};
 use ui::{h_flex, prelude::*, IconDecorationKind, Label};
 use util::{paths::PathExt, ResultExt, TryFutureExt};
 use workspace::item::{BreadcrumbText, FollowEvent};
+use workspace::item::{Dedup, ItemSettings, SerializableItem, TabContentParams};
 use workspace::{
     item::{FollowableItem, Item, ItemEvent, ProjectItem},
     searchable::{Direction, SearchEvent, SearchableItem, SearchableItemHandle},
-    ItemId, ItemNavHistory, Pane, ToolbarItemLocation, ViewId, Workspace, WorkspaceId,
+    ItemId, ItemNavHistory, ToolbarItemLocation, ViewId, Workspace, WorkspaceId,
 };
 
 pub const MAX_TAB_TITLE_LEN: usize = 24;
@@ -615,9 +613,20 @@ impl Item for Editor {
                 .read(cx)
                 .as_singleton()
                 .and_then(|buffer| buffer.read(cx).project_path(cx))
-                .and_then(|path| self.project.as_ref()?.read(cx).entry_for_path(&path, cx))
-                .map(|entry| {
-                    entry_git_aware_label_color(entry.git_status, entry.is_ignored, params.selected)
+                .and_then(|path| {
+                    let project = self.project.as_ref()?.read(cx);
+                    let entry = project.entry_for_path(&path, cx)?;
+                    let git_status = project
+                        .worktree_for_id(path.worktree_id, cx)?
+                        .read(cx)
+                        .snapshot()
+                        .status_for_file(path.path)?;
+
+                    Some(entry_git_aware_label_color(
+                        git_status.summary(),
+                        entry.is_ignored,
+                        params.selected,
+                    ))
                 })
                 .unwrap_or_else(|| entry_label_color(params.selected))
         } else {
@@ -665,7 +674,7 @@ impl Item for Editor {
     fn for_each_project_item(
         &self,
         cx: &AppContext,
-        f: &mut dyn FnMut(EntityId, &dyn project::Item),
+        f: &mut dyn FnMut(EntityId, &dyn project::ProjectItem),
     ) {
         self.buffer
             .read(cx)
@@ -733,11 +742,11 @@ impl Item for Editor {
         project: Model<Project>,
         cx: &mut ViewContext<Self>,
     ) -> Task<Result<()>> {
-        self.report_editor_event("save", None, cx);
+        self.report_editor_event("Editor Saved", None, cx);
         let buffers = self.buffer().clone().read(cx).all_buffers();
         let buffers = buffers
             .into_iter()
-            .map(|handle| handle.read(cx).diff_base_buffer().unwrap_or(handle.clone()))
+            .map(|handle| handle.read(cx).base_buffer().unwrap_or(handle.clone()))
             .collect::<HashSet<_>>();
         cx.spawn(|this, mut cx| async move {
             if format {
@@ -745,7 +754,7 @@ impl Item for Editor {
                     editor.perform_format(
                         project.clone(),
                         FormatTrigger::Save,
-                        FormatTarget::Buffer,
+                        FormatTarget::Buffers,
                         cx,
                     )
                 })?
@@ -805,7 +814,7 @@ impl Item for Editor {
             .path
             .extension()
             .map(|a| a.to_string_lossy().to_string());
-        self.report_editor_event("save", file_extension, cx);
+        self.report_editor_event("Editor Saved", file_extension, cx);
 
         project.update(cx, |project, cx| project.save_buffer_as(buffer, path, cx))
     }
@@ -841,7 +850,7 @@ impl Item for Editor {
         self.pixel_position_of_newest_cursor
     }
 
-    fn breadcrumb_location(&self) -> ToolbarItemLocation {
+    fn breadcrumb_location(&self, _: &AppContext) -> ToolbarItemLocation {
         if self.show_breadcrumbs {
             ToolbarItemLocation::PrimaryLeft
         } else {
@@ -954,7 +963,7 @@ impl SerializableItem for Editor {
         workspace: WeakView<Workspace>,
         workspace_id: workspace::WorkspaceId,
         item_id: ItemId,
-        cx: &mut ViewContext<Pane>,
+        cx: &mut WindowContext,
     ) -> Task<Result<View<Self>>> {
         let serialized_editor = match DB
             .get_serialized_editor(item_id, workspace_id)
@@ -989,7 +998,7 @@ impl SerializableItem for Editor {
                 contents: Some(contents),
                 language,
                 ..
-            } => cx.spawn(|pane, mut cx| {
+            } => cx.spawn(|mut cx| {
                 let project = project.clone();
                 async move {
                     let language = if let Some(language_name) = language {
@@ -1019,7 +1028,7 @@ impl SerializableItem for Editor {
                         buffer.set_text(contents, cx);
                     })?;
 
-                    pane.update(&mut cx, |_, cx| {
+                    cx.update(|cx| {
                         cx.new_view(|cx| {
                             let mut editor = Editor::for_buffer(buffer, Some(project), cx);
 
@@ -1046,7 +1055,7 @@ impl SerializableItem for Editor {
 
                 match project_item {
                     Some(project_item) => {
-                        cx.spawn(|pane, mut cx| async move {
+                        cx.spawn(|mut cx| async move {
                             let (_, project_item) = project_item.await?;
                             let buffer = project_item.downcast::<Buffer>().map_err(|_| {
                                 anyhow!("Project item at stored path was not a buffer")
@@ -1073,7 +1082,7 @@ impl SerializableItem for Editor {
                                 })?;
                             }
 
-                            pane.update(&mut cx, |_, cx| {
+                            cx.update(|cx| {
                                 cx.new_view(|cx| {
                                     let mut editor = Editor::for_buffer(buffer, Some(project), cx);
 
@@ -1087,7 +1096,7 @@ impl SerializableItem for Editor {
                         let open_by_abs_path = workspace.update(cx, |workspace, cx| {
                             workspace.open_abs_path(abs_path.clone(), false, cx)
                         });
-                        cx.spawn(|_, mut cx| async move {
+                        cx.spawn(|mut cx| async move {
                             let editor = open_by_abs_path?.await?.downcast::<Editor>().with_context(|| format!("Failed to downcast to Editor after opening abs path {abs_path:?}"))?;
                             editor.update(&mut cx, |editor, cx| {
                                 editor.read_scroll_position_from_db(item_id, workspace_id, cx);
@@ -1250,8 +1259,8 @@ impl SearchableItem for Editor {
             return;
         }
 
-        let ranges = self.selections.disjoint_anchor_ranges();
-        if ranges.iter().any(|range| range.start != range.end) {
+        let ranges = self.selections.disjoint_anchor_ranges().collect::<Vec<_>>();
+        if ranges.iter().any(|s| s.start != s.end) {
             self.set_search_within_ranges(&ranges, cx);
         } else if let Some(previous_search_ranges) = self.previous_search_ranges.take() {
             self.set_search_within_ranges(&previous_search_ranges, cx)
@@ -1550,20 +1559,18 @@ pub fn entry_diagnostic_aware_icon_decoration_and_color(
     }
 }
 
-pub fn entry_git_aware_label_color(
-    git_status: Option<GitFileStatus>,
-    ignored: bool,
-    selected: bool,
-) -> Color {
+pub fn entry_git_aware_label_color(git_status: GitSummary, ignored: bool, selected: bool) -> Color {
+    let tracked = git_status.index + git_status.worktree;
     if ignored {
         Color::Ignored
+    } else if git_status.conflict > 0 {
+        Color::Conflict
+    } else if tracked.modified > 0 {
+        Color::Modified
+    } else if tracked.added > 0 || git_status.untracked > 0 {
+        Color::Created
     } else {
-        match git_status {
-            Some(GitFileStatus::Added) => Color::Created,
-            Some(GitFileStatus::Modified) => Color::Modified,
-            Some(GitFileStatus::Conflict) => Color::Conflict,
-            None => entry_label_color(selected),
-        }
+        entry_label_color(selected)
     }
 }
 
@@ -1618,15 +1625,14 @@ fn path_for_file<'a>(
 #[cfg(test)]
 mod tests {
     use crate::editor_tests::init_test;
+    use fs::Fs;
 
     use super::*;
+    use fs::MTime;
     use gpui::{AppContext, VisualTestContext};
     use language::{LanguageMatcher, TestFile};
     use project::FakeFs;
-    use std::{
-        path::{Path, PathBuf},
-        time::SystemTime,
-    };
+    use std::path::{Path, PathBuf};
 
     #[gpui::test]
     fn test_path_for_file(cx: &mut AppContext) {
@@ -1679,9 +1685,7 @@ mod tests {
     async fn test_deserialize(cx: &mut gpui::TestAppContext) {
         init_test(cx, |_| {});
 
-        let now = SystemTime::now();
         let fs = FakeFs::new(cx.executor());
-        fs.set_next_mtime(now);
         fs.insert_file("/file.rs", Default::default()).await;
 
         // Test case 1: Deserialize with path and contents
@@ -1690,12 +1694,18 @@ mod tests {
             let (workspace, cx) = cx.add_window_view(|cx| Workspace::test_new(project.clone(), cx));
             let workspace_id = workspace::WORKSPACE_DB.next_id().await.unwrap();
             let item_id = 1234 as ItemId;
+            let mtime = fs
+                .metadata(Path::new("/file.rs"))
+                .await
+                .unwrap()
+                .unwrap()
+                .mtime;
 
             let serialized_editor = SerializedEditor {
                 abs_path: Some(PathBuf::from("/file.rs")),
                 contents: Some("fn main() {}".to_string()),
                 language: Some("Rust".to_string()),
-                mtime: Some(now),
+                mtime: Some(mtime),
             };
 
             DB.save_serialized_editor(item_id, workspace_id, serialized_editor.clone())
@@ -1792,9 +1802,7 @@ mod tests {
             let workspace_id = workspace::WORKSPACE_DB.next_id().await.unwrap();
 
             let item_id = 9345 as ItemId;
-            let old_mtime = now
-                .checked_sub(std::time::Duration::from_secs(60 * 60 * 24))
-                .unwrap();
+            let old_mtime = MTime::from_seconds_and_nanos(0, 50);
             let serialized_editor = SerializedEditor {
                 abs_path: Some(PathBuf::from("/file.rs")),
                 contents: Some("fn main() {}".to_string()),

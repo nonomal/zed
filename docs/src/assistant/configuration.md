@@ -10,6 +10,7 @@ The following providers are supported:
 - [Google AI](#google-ai) [^1]
 - [Ollama](#ollama)
 - [OpenAI](#openai)
+- [LM Studio](#lmstudio)
 
 To configure different providers, run `assistant: show configuration` in the command palette, or click on the hamburger menu at the top-right of the assistant panel and select "Configure".
 
@@ -192,6 +193,30 @@ The Zed Assistant comes pre-configured to use the latest version for common mode
 
 You must provide the model's Context Window in the `max_tokens` parameter, this can be found [OpenAI Model Docs](https://platform.openai.com/docs/models). OpenAI `o1` models should set `max_completion_tokens` as well to avoid incurring high reasoning token costs. Custom models will be listed in the model dropdown in the assistant panel.
 
+### OpenAI API Compatible
+
+Zed supports using OpenAI compatible APIs by specifying a custom `endpoint` and `available_models` for the OpenAI provider.
+
+#### X.ai Grok
+
+Example configuration for using X.ai Grok with Zed:
+
+```json
+  "language_models": {
+    "openai": {
+      "api_url": "https://api.x.ai/v1",
+      "available_models": [
+        {
+          "name": "grok-beta",
+          "display_name": "X.ai Grok (Beta)",
+          "max_tokens": 131072
+        }
+      ],
+      "version": "1"
+    },
+  }
+```
+
 ### Advanced configuration {#advanced-configuration}
 
 #### Example Configuration
@@ -211,6 +236,25 @@ You must provide the model's Context Window in the `max_tokens` parameter, this 
   }
 }
 ```
+
+### LM Studio {#lmstudio}
+
+1. Download and install the latest version of LM Studio from https://lmstudio.ai/download
+2. In the app press ⌘/Ctrl + Shift + M and download at least one model, e.g. qwen2.5-coder-7b
+
+   You can also get models via the LM Studio CLI:
+
+   ```sh
+   lms get qwen2.5-coder-7b
+   ```
+
+3. Make sure the LM Studio API server by running:
+
+   ```sh
+   lms server start
+   ```
+
+Tip: Set [LM Studio as a login item](https://lmstudio.ai/docs/advanced/headless#run-the-llm-service-on-machine-login) to automate running the LM Studio server.
 
 #### Custom endpoints {#custom-endpoint}
 

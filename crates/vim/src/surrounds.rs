@@ -6,7 +6,7 @@ use crate::{
 };
 use editor::{movement, scroll::Autoscroll, Bias};
 use language::BracketPair;
-use serde::Deserialize;
+
 use std::sync::Arc;
 use ui::ViewContext;
 
@@ -17,16 +17,6 @@ pub enum SurroundsType {
     Selection,
 }
 
-// This exists so that we can have Deserialize on Operators, but not on Motions.
-impl<'de> Deserialize<'de> for SurroundsType {
-    fn deserialize<D>(_: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        Err(serde::de::Error::custom("Cannot deserialize SurroundsType"))
-    }
-}
-
 impl Vim {
     pub fn add_surrounds(
         &mut self,
@@ -35,7 +25,7 @@ impl Vim {
         cx: &mut ViewContext<Self>,
     ) {
         self.stop_recording(cx);
-        let count = self.take_count(cx);
+        let count = Vim::take_count(cx);
         let mode = self.mode;
         self.update_editor(cx, |_, editor, cx| {
             let text_layout_details = editor.text_layout_details(cx);
